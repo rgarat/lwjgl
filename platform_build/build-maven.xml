@@ -60,9 +60,9 @@
 					<not><isset property="jinputversionmatches" /></not>
 					<not><isset property="overridejinput" /></not>
 				</and>
-			</condition>
-			<fail  if="failjinputcheck" message="Jinput version in project is different from the declared jinput version for maven add -Doverridejinput=true as a command line option to avoid this check" />
-		</target>
+			</condition>		
+			<fail  if="failjinputcheck" message="Jinput version in project (${jinputversion}) is different from the declared jinput version for maven (${jinput.version}) add -Doverridejinput=true as a command line option to avoid this check" />	
+	</target>
 
 	<target name="maven-full">
 		<antcall target="clean-java" />
