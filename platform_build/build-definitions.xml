@@ -12,7 +12,7 @@
 	<property name="lwjgl.docs" 				location="doc" />
 	<property name="lwjgl.temp" 				location="temp" />
 	<property name="lwjgl.res" 					location="res" />
-	<property name="lwjgl.version" 				value="2.8.0" />
+	<property name="lwjgl.version" 				value="2.8.1" />
 	<property name="lwjgl.web" 						location="www" />
 
 	<property name="opengl-template-pattern" value="org/lwjgl/opengl/GL*.java,org/lwjgl/opengl/ARB*.java,org/lwjgl/opengl/AMD*.java,org/lwjgl/opengl/APPLE*.java,org/lwjgl/opengl/ATI*.java,org/lwjgl/opengl/EXT*.java,org/lwjgl/opengl/NV*.java,org/lwjgl/opengl/NVX*.java,org/lwjgl/opengl/HP*.java,org/lwjgl/opengl/IBM*.java,org/lwjgl/opengl/SUN*.java,org/lwjgl/opengl/SGIS*.java,org/lwjgl/opengl/GREMEDY*.java"/>
@@ -35,15 +35,9 @@
 			<exclude name="org/lwjgl/examples/**" />
 		</patternset>
 	</fileset>
-
-	<!-- Files to include in the lwjgl.jar file, for the ES build -->
-	<fileset id="lwjgl_es.fileset" dir="${lwjgl.bin}">
-		<patternset id="lwjgl_es.package.pattern">
-			<include name="org/**/*"/>
-			<exclude name="org/lwjgl/d3d/**"/>
-			<exclude name="org/lwjgl/test/**"/>
-			<exclude name="org/lwjgl/util/**"/>
-			<exclude name="org/lwjgl/examples/**"/>
+	<fileset id="lwjgl.fileset.dependencies" dir="${lwjgl.bin}">
+		<patternset id="lwjgl.package.dependencies.pattern">
+			<include name="org/lwjgl/opengles/ContextAttribs*.*"/>
 		</patternset>
 	</fileset>
 

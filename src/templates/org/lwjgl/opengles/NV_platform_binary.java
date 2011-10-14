@@ -29,17 +29,11 @@
  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-package org.lwjgl.opengl;
+package org.lwjgl.opengles;
 
-/**
- * This enum can be used in the default Display.create method to specify
- * the context type that will be created.
- *
- * @author Spasi
- */
-public enum ContextType {
+public interface NV_platform_binary {
 
-	GL,
-	GLES,
+	/** Accepted by the &lt;binaryformat&gt; parameter of ShaderBinary: */
+	int GL_NVIDIA_PLATFORM_BINARY_NV = 0x890B;
 
 }

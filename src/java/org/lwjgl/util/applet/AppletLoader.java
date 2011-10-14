@@ -65,15 +65,23 @@ import java.net.URLClassLoader;
 import java.net.URLConnection;
 import java.security.AccessControlException;
 import java.security.AccessController;
+import java.security.AllPermission;
 import java.security.CodeSource;
 import java.security.PermissionCollection;
+import java.security.Permissions;
 import java.security.PrivilegedExceptionAction;
 import java.security.SecureClassLoader;
 import java.security.cert.Certificate;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.Queue;
 import java.util.StringTokenizer;
 import java.util.Vector;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
@@ -117,6 +125,7 @@ import java.util.zip.ZipFile;
  * <li>al_debug - [boolean] Whether to enable debug mode. <i>Default: false</i>.</li>
  * <li>al_min_jre - [String] Specify the minimum jre version that the applet requires, should be in format like 1.6.0_24 or a subset like 1.6 <i>Default: 1.5</i>.</li>
  * <li>al_prepend_host - [boolean] Whether to limit caching to this domain, disable if your applet is hosted on multiple domains and needs to share the cache. <i>Default: true</i>.</li>
+ * <li>al_lookup_threads - [int] Specify the number of concurrent threads to use to get file information before downloading. <i>Default: 1</i>.</li>
  * <p>
  * <li>al_windows64 - [String] If specified it will be used instead of al_windows on 64bit windows systems.</li>
  * <li>al_windows32 - [String] If specified it will be used instead of al_windows on 32bit windows systems.</li>
@@ -197,7 +206,7 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 	public static final int STATE_DONE 						= 12;
 
 	/** used to calculate length of progress bar */
-	protected int		percentage;
+	protected volatile int percentage;
 
 	/** current size of download in bytes */
 	protected int		currentSizeDownload;
@@ -283,6 +292,9 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 	/** messages to be passed via liveconnect in headless mode */
 	protected String[] 	headlessMessage;
 	
+	/** threads to use when fetching information of files to be downloaded */
+	protected int 		concurrentLookupThreads;
+	
 	/** whether a fatal error occurred */
 	protected boolean	fatalError;
 	
@@ -309,7 +321,7 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 	
 	/** fatal error message to display */
 	protected String[]	errorMessage;
-
+	
 	/** have natives been loaded by another instance of this applet */
 	protected static boolean natives_loaded;
 	
@@ -327,7 +339,7 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 				return;
 			}
 		}
-
+		
 		// whether to use cache system
 		cacheEnabled	= getBooleanParameter("al_cache", true);
 
@@ -339,6 +351,9 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 
 		// whether to run in headless mode
 		headless		= getBooleanParameter("al_headless", false);
+		
+		// obtain the number of concurrent lookup threads to use
+		concurrentLookupThreads = getIntParameter("al_lookup_threads", 1); // defaults to 1
 		
 		// get colors of applet
 		bgColor 		= getColor("boxbgcolor", Color.white);
@@ -694,10 +709,9 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 			file = file.replace(".pack", "");
 		}
 
-		if (!lzmaSupported) {
-			System.out.println("'lzma.jar' required for LZMA support!");
-			System.out.println("trying files without the lzma extension...");
+		if (!lzmaSupported && file.endsWith(".lzma")) {
 			file = file.replace(".lzma", "");
+			System.out.println("LZMA decoder (lzma.jar) not found, trying " + file + " without lzma extension.");
 		}
 		return file;
 	}
@@ -1155,13 +1169,31 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 			file = file.replace("!", "%21");
 			urls[i] = new URL(file);
 		}
-
+		
+		// get AppletLoader certificates
+		final Certificate[] certs = getCurrentCertificates();
+		
+		// detect if we are running on a mac and save result as boolean
+		String osName = System.getProperty("os.name");
+		final boolean isMacOS = (osName.startsWith("Mac") || osName.startsWith("Darwin"));
+		
 		// add downloaded jars to the classpath with required permissions
 		classLoader = new URLClassLoader(urls) {
 			protected PermissionCollection getPermissions (CodeSource codesource) {
 				PermissionCollection perms = null;
 
 				try {
+					
+					// if mac, apply workaround for the multiple security dialog issue
+					if (isMacOS) {
+						// if certificates match the AppletLoader certificates then don't use SecureClassLoader to get further permissions
+						if (certificatesMatch(certs, codesource.getCertificates())) {
+							perms = new Permissions();
+							perms.add(new AllPermission());
+							return perms;
+						}
+					}
+
 					// getPermissions from original classloader is important as it checks for signed jars and shows any security dialogs needed
 					Method method = SecureClassLoader.class.getDeclaredMethod("getPermissions", new Class[] { CodeSource.class });
 					method.setAccessible(true);
@@ -1307,8 +1339,6 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 		// store file sizes and mark which files not to download
 		fileSizes = new int[urlList.length];
 
-		URLConnection urlconnection;
-
 		File timestampsFile = new File(dir, "timestamps");
 
 		// if timestamps file exists, load it
@@ -1317,39 +1347,76 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 		}
 
 		// calculate total size of jars to download
-		for (int i = 0; i < urlList.length; i++) {
-			urlconnection = urlList[i].openConnection();
-			urlconnection.setDefaultUseCaches(false);
-			if (urlconnection instanceof HttpURLConnection) {
-				((HttpURLConnection) urlconnection).setRequestMethod("HEAD");
-			}
+		
+		ExecutorService executorService = Executors.newFixedThreadPool(concurrentLookupThreads);
+		Queue<Future> requests = new LinkedList<Future>();
+		
+		// create unique object to sync code in requests 
+		final Object sync = new Integer(1);
+		
+		for (int j = 0; j < urlList.length; j++) {
+			final int i = j;
+			
+			Future request = executorService.submit(new Runnable() {
+				
+				public void run() {
+					
+					try {
+						
+						URLConnection urlconnection = urlList[i].openConnection();
+						urlconnection.setDefaultUseCaches(false);
+						if (urlconnection instanceof HttpURLConnection) {
+							((HttpURLConnection) urlconnection).setRequestMethod("HEAD");
+						}
+		 
+						fileSizes[i] = urlconnection.getContentLength();
 
-			fileSizes[i] = urlconnection.getContentLength();
+						long lastModified = urlconnection.getLastModified();
+						String fileName = getFileName(urlList[i]);
 
-			long lastModified = urlconnection.getLastModified();
-			String fileName = getFileName(urlList[i]);
+						if (cacheEnabled && lastModified != 0 && filesLastModified.containsKey(fileName)) {
+							long savedLastModified = filesLastModified.get(fileName);
 
+							// if lastModifed time is the same, don't redownload
+							if (savedLastModified == lastModified) {
+								fileSizes[i] = -2; // mark it to not redownload
+							}
+						}
+			 
+						if (fileSizes[i] >= 0) {
+							synchronized (sync) {
+								totalSizeDownload += fileSizes[i];
+							}
+						}
 
-			if (cacheEnabled && lastModified != 0 &&
-					filesLastModified.containsKey(fileName)) {
-				long savedLastModified = filesLastModified.get(fileName);
-
-				// if lastModifed time is the same, don't redownload
-				if (savedLastModified == lastModified) {
-					fileSizes[i] = -2; // mark it to not redownload
-				}
-			}
-
-			if (fileSizes[i] >= 0) {
-				totalSizeDownload += fileSizes[i];
-			}
-
-			// put key and value in the hashmap
-			filesLastModified.put(fileName, lastModified);
-
-			// update progress bar
-			percentage = 5 + (int)(10 * i/(float)urlList.length);
+						// put key and value in the hashmap
+						filesLastModified.put(fileName, lastModified);
+									
+					} catch (Exception e) {
+						throw new RuntimeException("Failed to fetch information for " + urlList[i], e);
+					}				
+				}});
+			
+			requests.add(request);
 		}
+			
+		while (!requests.isEmpty()) {
+			Iterator<Future> iterator = requests.iterator();
+			while (iterator.hasNext()) {
+				Future request = iterator.next();
+					if (request.isDone()) {
+						request.get(); // will throw an exception if request thrown an exception.
+						iterator.remove();
+						
+						// update progress bar
+						percentage = 5 + (int) (10 * (urlList.length - requests.size()) / (float) urlList.length);
+					}
+			}
+		
+			Thread.sleep(10);
+		}
+		
+		executorService.shutdown();
 	}
 
 	/**
@@ -1666,18 +1733,8 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 			nativeFolder.mkdir();
 		}
 		
-		// get the current certificate to compare against native files
-		Certificate[] certificate = AppletLoader.class.getProtectionDomain().getCodeSource().getCertificates();
-
-		// workaround for bug where cached applet loader does not have certificates!?
-		if (certificate == null) {
-			URL location = AppletLoader.class.getProtectionDomain().getCodeSource().getLocation();
-
-			// manually load the certificate
-			JarURLConnection jurl = (JarURLConnection) (new URL("jar:" + location.toString() + "!/org/lwjgl/util/applet/AppletLoader.class").openConnection());
-			jurl.setDefaultUseCaches(true);
-			certificate = jurl.getCertificates();
-		}
+		// get the current AppletLoader certificates to compare against certificates of the native files
+		Certificate[] certificate = getCurrentCertificates();
 		
 		for (int i = urlList.length - nativeJarCount; i < urlList.length; i++) {
 			
@@ -1755,8 +1812,11 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 				in.close();
 				out.close();
 				
-				// validate if the certificate for native file
-				validateCertificateChain(certificate, entry.getCertificates());
+				// validate the certificate for the native file being extracted
+				if (!certificatesMatch(certificate, entry.getCertificates())) {
+					f.delete(); // delete extracted native as its certificates doesn't match
+					throw new Exception("The certificate(s) in " + nativeJar + " do not match the AppletLoader!");
+				}
 			}
 			subtaskMessage = "";
 	
@@ -1770,23 +1830,53 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 	}
 
 	/**
-	 * Validates the certificate chain for a single file
+	 * Compare two certificate chains to see if they match
 	 *
-	 * @param ownCerts Chain of certificates to check against
-	 * @param native_certs Chain of certificates to check
+	 * @param cert1 first chain of certificates
+	 * @param cert2 second chain of certificates
+	 * 
+	 * @return true if the certificate chains are the same
 	 */
-	protected static void validateCertificateChain(Certificate[] ownCerts, Certificate[] native_certs) throws Exception {
-		if (native_certs == null)
-			throw new Exception("Unable to validate certificate chain. Native entry did not have a certificate chain at all");
-
-		if (ownCerts.length != native_certs.length)
-			throw new Exception("Unable to validate certificate chain. Chain differs in length [" + ownCerts.length + " vs " + native_certs.length + "]");
-
-		for (int i = 0; i < ownCerts.length; i++) {
-			if (!ownCerts[i].equals(native_certs[i])) {
-				throw new Exception("Certificate mismatch: " + ownCerts[i] + " != " + native_certs[i]);
+	protected static boolean certificatesMatch(Certificate[] certs1, Certificate[] certs2) throws Exception {
+		if (certs1 == null || certs2 == null) {
+			return false;
+		}
+		
+		if (certs1.length != certs2.length) {
+			System.out.println("Certificate chain differs in length!");
+			return false;
+		}
+		
+		for (int i = 0; i < certs1.length; i++) {
+			if (!certs1[i].equals(certs2[i])) {
+				System.out.println("Certificate mismatch found!");
+				return false;
 			}
 		}
+		
+		return true;
+	}
+	
+	/**
+	 * Returns the current certificate chain of the AppletLoader
+	 * 
+	 * @return - certificate chain of AppletLoader
+	 */
+	protected static Certificate[] getCurrentCertificates() throws Exception {
+		// get the current certificate to compare against native files
+		Certificate[] certificate = AppletLoader.class.getProtectionDomain().getCodeSource().getCertificates();
+		
+		// workaround for bug where cached applet loader does not have certificates!?
+		if (certificate == null) {
+			URL location = AppletLoader.class.getProtectionDomain().getCodeSource().getLocation();
+
+			// manually load the certificate
+			JarURLConnection jurl = (JarURLConnection) (new URL("jar:" + location.toString() + "!/org/lwjgl/util/applet/AppletLoader.class").openConnection());
+			jurl.setDefaultUseCaches(true);
+			certificate = jurl.getCertificates();
+		}
+		
+		return certificate;
 	}
 	
 	/**
@@ -1911,11 +2001,12 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 	 */
 	public Image getImage(URL url) {
 		try {
+			MediaTracker tracker = new MediaTracker(this);
+			
 			Image image = super.getImage(url);
 
 			// wait for image to load
-			MediaTracker tracker = new MediaTracker(this);
-	        tracker.addImage(image, 0);
+			tracker.addImage(image, 0);
 	        tracker.waitForAll();
 
 	        // if no errors return image
@@ -2047,8 +2138,22 @@ public class AppletLoader extends Applet implements Runnable, AppletStub {
 	 */
 	protected boolean getBooleanParameter(String name, boolean defaultValue) {
 		String parameter = getParameter(name);
-		if(parameter != null) {
+		if (parameter != null) {
 			return Boolean.parseBoolean(parameter);
+		}
+		return defaultValue;
+	}
+	
+	/**
+	 * Retrieves the int value for the applet
+	 * @param name Name of parameter
+	 * @param defaultValue default value to return if no such parameter
+	 * @return value of parameter or defaultValue
+	 */
+	protected int getIntParameter(String name, int defaultValue) {
+		String parameter = getParameter(name);
+		if (parameter != null) {
+			return Integer.parseInt(parameter);
 		}
 		return defaultValue;
 	}

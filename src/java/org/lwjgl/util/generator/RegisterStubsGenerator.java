@@ -101,10 +101,11 @@ public class RegisterStubsGenerator {
 		final CachedResult cached_result_annotation = method.getAnnotation(CachedResult.class);
 		final AutoSize auto_size_annotation = method.getAnnotation(AutoSize.class);
 
-		if ( Utils.getNIOBufferType(result_type) != null && (auto_size_annotation == null || !auto_size_annotation.isNative()) )
+		final boolean isNIOBuffer = Utils.getNIOBufferType(result_type) != null;
+		if ( isNIOBuffer && (auto_size_annotation == null || !auto_size_annotation.isNative()) )
 			signature += "J";
 
-		String result_type_signature = getTypeSignature(result_type, false);
+		final String result_type_signature = isNIOBuffer ? "Ljava/nio/ByteBuffer;" : getTypeSignature(result_type, false);
 		if ( cached_result_annotation != null )
 			signature += result_type_signature;
 
@@ -125,7 +126,7 @@ public class RegisterStubsGenerator {
 		final Alternate alt_annotation = method.getAnnotation(Alternate.class);
 		final String methodName = alt_annotation == null ? method.getSimpleName() : alt_annotation.value();
 		String opengl_handle_name = methodName.replaceFirst("gl", platform.getPrefix());
-		writer.print(", \"" + opengl_handle_name + "\", (void *)&" + methodName + "}");
+		writer.print(", \"" + opengl_handle_name + "\", (void *)&" + methodName + ", " + (method.getAnnotation(Optional.class) == null ? "false" : "true") + "}");
 		if (has_more)
 			writer.println(",");
 	}
